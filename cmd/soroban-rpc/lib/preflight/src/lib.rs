@@ -3,7 +3,9 @@ extern crate base64;
 extern crate libc;
 extern crate sha2;
 extern crate soroban_env_host;
+extern crate soroban_env_host_21;
 extern crate soroban_simulation;
+extern crate soroban_simulation_21;
 
 use anyhow::{anyhow, bail, Result};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,23 @@ use soroban_simulation::simulation::{
     SimulationAdjustmentConfig,
 };
 use soroban_simulation::{AutoRestoringSnapshotSource, NetworkConfig, SnapshotSourceWithArchive};
+
+// Imports for the legacy protocol-21 version; these (and everything that uses
+// them) can be deleted once the network transitions fully to protocol 22.
+use soroban_env_host_21::{HostError as HostError21, LedgerInfo as LedgerInfo21};
+use soroban_simulation_21::simulation::{
+    simulate_extend_ttl_op as simulate_extend_ttl_op_21,
+    simulate_invoke_host_function_op as simulate_invoke_host_function_op_21,
+    simulate_restore_op as simulate_restore_op_21,
+    InvokeHostFunctionSimulationResult as InvokeHostFunctionSimulationResult21,
+    LedgerEntryDiff as LedgerEntryDiff21, RestoreOpSimulationResult as RestoreOpSimulationResult21,
+    SimulationAdjustmentConfig as SimulationAdjustmentConfig21,
+};
+use soroban_simulation_21::{
+    AutoRestoringSnapshotSource as AutoRestoringSnapshotSource21, NetworkConfig as NetworkConfig21,
+    SnapshotSourceWithArchive as SnapshotSourceWithArchive21,
+};
+
 use std::cell::RefCell;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
@@ -188,6 +207,34 @@ impl CPreflightResult {
         result
     }
 
+    fn new_from_invoke_host_function_21(
+        invoke_hf_result: InvokeHostFunctionSimulationResult21,
+        restore_preamble: Option<RestoreOpSimulationResult21>,
+        error: String,
+    ) -> Self {
+        let mut result = Self {
+            error: string_to_c(error),
+            auth: xdr_vec_to_c(&invoke_hf_result.auth),
+            result: option_xdr_to_c(invoke_hf_result.invoke_result.ok().as_ref()),
+            min_fee: invoke_hf_result
+                .transaction_data
+                .as_ref()
+                .map_or_else(|| 0, |r| r.resource_fee),
+            transaction_data: option_xdr_to_c(invoke_hf_result.transaction_data.as_ref()),
+            // TODO: Diagnostic and contract events should be separated in the response
+            events: xdr_vec_to_c(&invoke_hf_result.diagnostic_events),
+            cpu_instructions: u64::from(invoke_hf_result.simulated_instructions),
+            memory_bytes: u64::from(invoke_hf_result.simulated_memory),
+            ledger_entry_diff: ledger_entry_diff_vec_to_c_21(&invoke_hf_result.modified_entries),
+            ..Default::default()
+        };
+        if let Some(p) = restore_preamble {
+            result.pre_restore_min_fee = p.transaction_data.resource_fee;
+            result.pre_restore_transaction_data = xdr_to_c(&p.transaction_data);
+        };
+        result
+    }
+
     fn new_from_transaction_data(
         transaction_data: Option<&SorobanTransactionData>,
         restore_preamble: Option<&RestoreOpSimulationResult>,
@@ -230,6 +277,38 @@ pub extern "C" fn preflight_invoke_hf_op(
 }
 
 fn preflight_invoke_hf_op_or_maybe_panic(
+    handle: libc::uintptr_t,
+    invoke_hf_op: CXDR,   // InvokeHostFunctionOp XDR in base64
+    source_account: CXDR, // AccountId XDR in base64
+    c_ledger_info: CLedgerInfo,
+    resource_config: CResourceConfig,
+    enable_debug: bool,
+) -> Result<CPreflightResult> {
+    // When the network transitions fully to protocol 22, delete this function
+    // and the _21 version and rename preflight_invoke_hf_op_or_maybe_panic_22 as
+    // preflight_invoke_hf_op_or_maybe_panic.
+    if c_ledger_info.protocol_version == 21 {
+        preflight_invoke_hf_op_or_maybe_panic_21(
+            handle,
+            invoke_hf_op,
+            source_account,
+            c_ledger_info,
+            resource_config,
+            enable_debug,
+        )
+    } else {
+        preflight_invoke_hf_op_or_maybe_panic_22(
+            handle,
+            invoke_hf_op,
+            source_account,
+            c_ledger_info,
+            resource_config,
+            enable_debug,
+        )
+    }
+}
+
+fn preflight_invoke_hf_op_or_maybe_panic_21(
     handle: libc::uintptr_t,
     invoke_hf_op: CXDR,   // InvokeHostFunctionOp XDR in base64
     source_account: CXDR, // AccountId XDR in base64
@@ -294,6 +373,73 @@ fn preflight_invoke_hf_op_or_maybe_panic(
     ))
 }
 
+fn preflight_invoke_hf_op_or_maybe_panic_22(
+    handle: libc::uintptr_t,
+    invoke_hf_op: CXDR,   // InvokeHostFunctionOp XDR in base64
+    source_account: CXDR, // AccountId XDR in base64
+    c_ledger_info: CLedgerInfo,
+    resource_config: CResourceConfig,
+    enable_debug: bool,
+) -> Result<CPreflightResult> {
+    let invoke_hf_op =
+        InvokeHostFunctionOp::from_xdr(from_c_xdr(invoke_hf_op), DEFAULT_XDR_RW_LIMITS).unwrap();
+    let source_account =
+        AccountId::from_xdr(from_c_xdr(source_account), DEFAULT_XDR_RW_LIMITS).unwrap();
+    let go_storage = Rc::new(GoLedgerStorage::new(handle));
+    let network_config =
+        NetworkConfig::load_from_snapshot(go_storage.as_ref(), c_ledger_info.bucket_list_size)?;
+    let ledger_info = fill_ledger_info(c_ledger_info, &network_config);
+    let ledger_info = ledger_info_21(&ledger_info);
+    let network_config = network_config_21(&network_config);
+    let auto_restore_snapshot = Rc::new(AutoRestoringSnapshotSource21::new(
+        go_storage.clone(),
+        &ledger_info,
+    )?);
+
+    let mut adjustment_config = SimulationAdjustmentConfig21::default_adjustment();
+    // It would be reasonable to extend `resource_config` to be compatible with `adjustment_config`
+    // in order to let the users customize the resource/fee adjustments in a more granular fashion.
+
+    let instruction_leeway = u32::try_from(resource_config.instruction_leeway)?;
+    adjustment_config.instructions.additive_factor = adjustment_config
+        .instructions
+        .additive_factor
+        .max(instruction_leeway);
+    // Here we assume that no input auth means that the user requests the recording auth.
+    let auth_entries = if invoke_hf_op.auth.is_empty() {
+        None
+    } else {
+        Some(invoke_hf_op.auth.to_vec())
+    };
+    // Invoke the host function. The user errors should normally be captured in `invoke_hf_result.invoke_result` and
+    // this should return Err result for misconfigured ledger.
+    let invoke_hf_result = simulate_invoke_host_function_op_21(
+        auto_restore_snapshot.clone(),
+        &network_config,
+        &adjustment_config,
+        &ledger_info,
+        invoke_hf_op.host_function,
+        auth_entries,
+        &source_account,
+        rand::Rng::gen(&mut rand::thread_rng()),
+        enable_debug,
+    )?;
+    let maybe_restore_result = match &invoke_hf_result.invoke_result {
+        Ok(_) => auto_restore_snapshot.simulate_restore_keys_op(
+            &network_config,
+            &SimulationAdjustmentConfig21::default_adjustment(),
+            &ledger_info,
+        ),
+        Err(e) => Err(e.clone().into()),
+    };
+    let error_str = extract_error_string(&maybe_restore_result, go_storage.as_ref());
+    Ok(CPreflightResult::new_from_invoke_host_function_21(
+        invoke_hf_result,
+        maybe_restore_result.unwrap_or(None),
+        error_str,
+    ))
+}
+
 #[no_mangle]
 pub extern "C" fn preflight_footprint_ttl_op(
     handle: libc::uintptr_t, // Go Handle to forward to SnapshotSourceGet and SnapshotSourceHas
@@ -333,7 +479,140 @@ fn preflight_footprint_ttl_op_or_maybe_panic(
     }
 }
 
+fn fee_configuration_21(
+    fee_configuration: &soroban_env_host::fees::FeeConfiguration,
+) -> soroban_env_host_21::fees::FeeConfiguration {
+    soroban_env_host_21::fees::FeeConfiguration {
+        fee_per_instruction_increment: fee_configuration.fee_per_instruction_increment,
+        fee_per_read_entry: fee_configuration.fee_per_read_entry,
+        fee_per_write_entry: fee_configuration.fee_per_write_entry,
+        fee_per_read_1kb: fee_configuration.fee_per_read_1kb,
+        fee_per_write_1kb: fee_configuration.fee_per_write_1kb,
+        fee_per_historical_1kb: fee_configuration.fee_per_historical_1kb,
+        fee_per_contract_event_1kb: fee_configuration.fee_per_contract_event_1kb,
+        fee_per_transaction_size_1kb: fee_configuration.fee_per_transaction_size_1kb,
+    }
+}
+
+fn rent_fee_configuration_21(
+    rent_fee_configuration: &soroban_env_host::fees::RentFeeConfiguration,
+) -> soroban_env_host_21::fees::RentFeeConfiguration {
+    soroban_env_host_21::fees::RentFeeConfiguration {
+        fee_per_write_1kb: rent_fee_configuration.fee_per_write_1kb,
+        fee_per_write_entry: rent_fee_configuration.fee_per_write_entry,
+        persistent_rent_rate_denominator: rent_fee_configuration.persistent_rent_rate_denominator,
+        temporary_rent_rate_denominator: rent_fee_configuration.temporary_rent_rate_denominator,
+    }
+}
+
+fn network_config_21(network_config: &NetworkConfig) -> NetworkConfig21 {
+    NetworkConfig21 {
+        fee_configuration: fee_configuration_21(&network_config.fee_configuration),
+        rent_fee_configuration: rent_fee_configuration_21(&network_config.rent_fee_configuration),
+        cpu_cost_params: network_config.cpu_cost_params.clone(),
+        memory_cost_params: network_config.memory_cost_params.clone(),
+        min_temp_entry_ttl: network_config.min_temp_entry_ttl,
+        min_persistent_entry_ttl: network_config.min_persistent_entry_ttl,
+        tx_max_instructions: network_config.tx_max_instructions,
+        tx_memory_limit: network_config.tx_memory_limit,
+        max_entry_ttl: network_config.max_entry_ttl,
+    }
+}
+
+fn ledger_info_21(ledger_info: &LedgerInfo) -> LedgerInfo21 {
+    LedgerInfo21 {
+        protocol_version: ledger_info.protocol_version,
+        sequence_number: ledger_info.sequence_number,
+        timestamp: ledger_info.timestamp,
+        network_id: ledger_info.network_id,
+        base_reserve: ledger_info.base_reserve,
+        min_temp_entry_ttl: ledger_info.min_temp_entry_ttl,
+        min_persistent_entry_ttl: ledger_info.min_persistent_entry_ttl,
+        max_entry_ttl: ledger_info.max_entry_ttl,
+    }
+}
+
+fn restore_op_simulation_result_from_21(
+    result: Result<Option<RestoreOpSimulationResult21>>,
+) -> Result<Option<RestoreOpSimulationResult>> {
+    match result {
+        Ok(Some(r)) => Ok(Some(RestoreOpSimulationResult {
+            transaction_data: r.transaction_data,
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn preflight_extend_ttl_op(
+    extend_op: &ExtendFootprintTtlOp,
+    keys_to_extend: &[LedgerKey],
+    go_storage: &Rc<GoLedgerStorage>,
+    network_config: &NetworkConfig,
+    ledger_info: &LedgerInfo,
+) -> Result<CPreflightResult> {
+    // When the network transitions fully to protocol 22, delete this function
+    // and the _21 version and rename preflight_extend_ttl_op_22 as
+    // preflight_extend_ttl_op.
+    if ledger_info.protocol_version == 21 {
+        preflight_extend_ttl_op_21(
+            extend_op,
+            keys_to_extend,
+            go_storage,
+            network_config,
+            ledger_info,
+        )
+    } else {
+        preflight_extend_ttl_op_22(
+            extend_op,
+            keys_to_extend,
+            go_storage,
+            network_config,
+            ledger_info,
+        )
+    }
+}
+
+fn preflight_extend_ttl_op_21(
+    extend_op: &ExtendFootprintTtlOp,
+    keys_to_extend: &[LedgerKey],
+    go_storage: &Rc<GoLedgerStorage>,
+    network_config: &NetworkConfig,
+    ledger_info: &LedgerInfo,
+) -> Result<CPreflightResult> {
+    let ledger_info: LedgerInfo21 = ledger_info_21(ledger_info);
+    let network_config = network_config_21(network_config);
+    let auto_restore_snapshot =
+        AutoRestoringSnapshotSource21::new(go_storage.clone(), &ledger_info)?;
+    let simulation_result = simulate_extend_ttl_op_21(
+        &auto_restore_snapshot,
+        &network_config,
+        &SimulationAdjustmentConfig21::default_adjustment(),
+        &ledger_info,
+        keys_to_extend,
+        extend_op.extend_to,
+    );
+    let (maybe_transaction_data, maybe_restore_result) = match simulation_result {
+        Ok(r) => (
+            Some(r.transaction_data),
+            auto_restore_snapshot.simulate_restore_keys_op(
+                &network_config,
+                &SimulationAdjustmentConfig21::default_adjustment(),
+                &ledger_info,
+            ),
+        ),
+        Err(e) => (None, Err(e)),
+    };
+    let maybe_restore_result = restore_op_simulation_result_from_21(maybe_restore_result);
+    let error_str = extract_error_string(&maybe_restore_result, go_storage);
+    Ok(CPreflightResult::new_from_transaction_data(
+        maybe_transaction_data.as_ref(),
+        maybe_restore_result.ok().flatten().as_ref(),
+        error_str,
+    ))
+}
+
+fn preflight_extend_ttl_op_22(
     extend_op: &ExtendFootprintTtlOp,
     keys_to_extend: &[LedgerKey],
     go_storage: &Rc<GoLedgerStorage>,
@@ -370,6 +649,45 @@ fn preflight_extend_ttl_op(
 }
 
 fn preflight_restore_op(
+    keys_to_restore: &[LedgerKey],
+    go_storage: &Rc<GoLedgerStorage>,
+    network_config: &NetworkConfig,
+    ledger_info: &LedgerInfo,
+) -> CPreflightResult {
+    // When the network transitions fully to protocol 22, delete this function
+    // and the _21 version and rename preflight_restore_op_22 as
+    // preflight_restore_op.
+    if ledger_info.protocol_version == 21 {
+        preflight_restore_op_21(keys_to_restore, go_storage, network_config, ledger_info)
+    } else {
+        preflight_restore_op_22(keys_to_restore, go_storage, network_config, ledger_info)
+    }
+}
+
+fn preflight_restore_op_21(
+    keys_to_restore: &[LedgerKey],
+    go_storage: &Rc<GoLedgerStorage>,
+    network_config: &NetworkConfig,
+    ledger_info: &LedgerInfo,
+) -> CPreflightResult {
+    let network_config = network_config_21(network_config);
+    let ledger_info: LedgerInfo21 = ledger_info_21(ledger_info);
+    let simulation_result = simulate_restore_op_21(
+        go_storage.as_ref(),
+        &network_config,
+        &SimulationAdjustmentConfig21::default_adjustment(),
+        &ledger_info,
+        keys_to_restore,
+    );
+    let error_str = extract_error_string(&simulation_result, go_storage.as_ref());
+    CPreflightResult::new_from_transaction_data(
+        simulation_result.ok().map(|r| r.transaction_data).as_ref(),
+        None,
+        error_str,
+    )
+}
+
+fn preflight_restore_op_22(
     keys_to_restore: &[LedgerKey],
     go_storage: &Rc<GoLedgerStorage>,
     network_config: &NetworkConfig,
@@ -441,6 +759,13 @@ fn ledger_entry_diff_to_c(v: &LedgerEntryDiff) -> CXDRDiff {
     }
 }
 
+fn ledger_entry_diff_to_c_21(v: &LedgerEntryDiff21) -> CXDRDiff {
+    CXDRDiff {
+        before: option_xdr_to_c(v.state_before.as_ref()),
+        after: option_xdr_to_c(v.state_after.as_ref()),
+    }
+}
+
 fn xdr_vec_to_c(v: &[impl WriteXdr]) -> CXDRVector {
     let c_v = v.iter().map(xdr_to_c).collect();
     let (array, len) = vec_to_c_array(c_v);
@@ -470,6 +795,15 @@ fn ledger_entry_diff_vec_to_c(modified_entries: &[LedgerEntryDiff]) -> CXDRDiffV
     let c_diffs = modified_entries
         .iter()
         .map(ledger_entry_diff_to_c)
+        .collect();
+    let (array, len) = vec_to_c_array(c_diffs);
+    CXDRDiffVector { array, len }
+}
+
+fn ledger_entry_diff_vec_to_c_21(modified_entries: &[LedgerEntryDiff21]) -> CXDRDiffVector {
+    let c_diffs = modified_entries
+        .iter()
+        .map(ledger_entry_diff_to_c_21)
         .collect();
     let (array, len) = vec_to_c_array(c_diffs);
     CXDRDiffVector { array, len }
@@ -634,6 +968,27 @@ impl SnapshotSourceWithArchive for GoLedgerStorage {
         &self,
         key: &Rc<LedgerKey>,
     ) -> std::result::Result<Option<EntryWithLiveUntil>, HostError> {
+        let res = self.get_fallible(key.as_ref());
+        match res {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                // Store the internal error in the storage as the info won't be propagated from simulation.
+                if let Ok(mut err) = self.internal_error.try_borrow_mut() {
+                    *err = Some(e);
+                }
+                // Errors that occur in storage are not recoverable, so we force host to halt by passing
+                // it an internal error.
+                Err((ScErrorType::Storage, ScErrorCode::InternalError).into())
+            }
+        }
+    }
+}
+
+impl SnapshotSourceWithArchive21 for GoLedgerStorage {
+    fn get_including_archived(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> std::result::Result<Option<EntryWithLiveUntil>, HostError21> {
         let res = self.get_fallible(key.as_ref());
         match res {
             Ok(res) => Ok(res),
